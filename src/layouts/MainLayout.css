@@ -1,0 +1,33 @@
+.main-layout {
+  position: relative;
+  min-height: 100vh;
+  overflow: hidden;
+}
+
+.ant-blur-gradient {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: 
+    radial-gradient(circle at 30% 30%, #581c8717, #000000bd 50%), 
+    radial-gradient(circle at 70% 70%, #6366f194, #000 50%), 
+    radial-gradient(circle at 50% 50%, #000000, #000);
+  z-index: -1;
+  background-size: 200% 200%;
+  animation: moveBackground 20s ease-in-out infinite;
+}
+
+
+@keyframes moveBackground {
+  0% {
+    background-position: 30% 30%, 70% 70%, center;
+  }
+  50% {
+    background-position: 40% 40%, 60% 60%, center;
+  }
+  100% {
+    background-position: 30% 30%, 70% 70%, center;
+  }
+}
