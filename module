@@ -1,0 +1,76 @@
+import os
+import socket
+import subprocess
+import sys
+
+PORT = 5005
+RULE_NAME = "Rem_TCP_5005"
+
+
+def run(cmd):
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    return p.returncode, (p.stdout + p.stderr).strip()
+
+
+def ensure_firewall_rule():
+    if os.name != "nt":
+        return
+
+    # เปิดให้ขาเข้าผ่าน Windows Firewall (Public/Private/Domain)
+    cmd = [
+        "netsh",
+        "advfirewall",
+        "firewall",
+        "add",
+        "rule",
+        f"name={RULE_NAME}",
+        "dir=in",
+        "action=allow",
+        "protocol=TCP",
+        f"localport={PORT}",
+        "enable=yes",
+        "profile=any",
+    ]
+
+    code, out = run(cmd)
+
+    # ถ้ามีอยู่แล้ว ให้ถือว่าโอเค
+    if code != 0:
+        if "The specified rule already exists" not in out:
+            print(out)
+
+
+def can_bind(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def main():
+    ensure_firewall_rule()
+
+    # ถ้าอยาก “เปิด port ให้ใช้งานจริง” ต้องมีโปรเซส LISTEN อยู่แล้ว
+    # ตัวนี้จะเริ่ม server จากไฟล์ server.py
+    if not can_bind(PORT):
+        print(f"พอร์ต {PORT} ถูกใช้งานอยู่แล้ว (มีโปรแกรม LISTEN อยู่)")
+        return
+
+    import server
+
+    try:
+        server.main()
+    except AttributeError:
+        print("ไม่พบ server.main() ใน server.py")
+        raise
+
+
+if __name__ == "__main__":
+    main()
