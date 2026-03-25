@@ -1,0 +1,293 @@
+import base64
+import ctypes
+import json
+import os
+import socket
+import threading
+
+HOST = "0.0.0.0"
+PORT = 5005
+
+TOKEN = "bd_servertest"
+MAX_FILE_BYTES = 100 * 1024 * 1024 * 1024
+MAX_SINGLE_BYTES = 16 * 1024 * 1024
+CHUNK_BYTES = 1024 * 1024
+
+
+def normalize_windows_path(path):
+    path = "" if path is None else str(path)
+    path = path.strip().replace("/", "\\")
+    return path
+
+
+def is_abs_windows_path(path):
+    # รองรับแบบ: C:\..., D:\..., \\server\share\...
+    if not path or len(path) < 3:
+        return False
+    if path.startswith("\\\\"):
+        return True
+    return path[1] == ":" and (path[2] == "\\" or path[2] == "/")
+
+
+def require_abs_windows_path(path):
+    path = normalize_windows_path(path)
+    if not is_abs_windows_path(path):
+        raise ValueError("path must be absolute like C:\\folder (or \\\\server\\share)")
+    return path
+
+
+def send_json(f, payload):
+    f.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+
+
+def handle_list_dir(root_path):
+    if not os.path.isdir(root_path):
+        raise FileNotFoundError("folder not found")
+
+    items = []
+    for entry in os.scandir(root_path):
+        stat = entry.stat(follow_symlinks=False)
+        items.append(
+            {
+                "name": entry.name,
+                "type": "dir" if entry.is_dir(follow_symlinks=False) else "file",
+                "size": stat.st_size if entry.is_file(follow_symlinks=False) else None,
+                "mtime": int(stat.st_mtime),
+            }
+        )
+
+    items.sort(key=lambda x: (x["type"], x["name"]))
+    return items
+
+
+def handle_read_text(file_path):
+    stat = os.stat(file_path)
+    if stat.st_size > MAX_FILE_BYTES:
+        raise ValueError("file too large")
+
+    with open(file_path, "rb") as f:
+        raw = f.read()
+
+    return base64.b64encode(raw).decode("ascii")
+
+
+def handle_read_file(file_path):
+    stat = os.stat(file_path)
+    if stat.st_size > MAX_FILE_BYTES:
+        raise ValueError("file too large")
+    if stat.st_size > MAX_SINGLE_BYTES:
+        raise ValueError("file too large for one-shot transfer; use download")
+
+    with open(file_path, "rb") as f:
+        raw = f.read()
+
+    return {"content_b64": base64.b64encode(raw).decode("ascii"), "size": int(stat.st_size)}
+
+
+def handle_read_file_chunk(file_path, offset, length):
+    stat = os.stat(file_path)
+    size = int(stat.st_size)
+    if size > MAX_FILE_BYTES:
+        raise ValueError("file too large")
+
+    offset = int(offset)
+    if offset < 0:
+        raise ValueError("bad offset")
+
+    if offset >= size:
+        return {"offset": offset, "size": size, "eof": True, "content_b64": "", "read_bytes": 0}
+
+    length = int(length)
+    if length <= 0:
+        raise ValueError("bad length")
+
+    if length > CHUNK_BYTES:
+        length = CHUNK_BYTES
+
+    remaining = size - offset
+    if length > remaining:
+        length = remaining
+
+    with open(file_path, "rb") as f:
+        f.seek(offset)
+        raw = f.read(length)
+
+    read_bytes = len(raw)
+    eof = offset + read_bytes >= size
+
+    return {
+        "offset": offset,
+        "size": size,
+        "eof": eof,
+        "content_b64": base64.b64encode(raw).decode("ascii"),
+        "read_bytes": read_bytes,
+    }
+
+def handle_write_text(file_path, content_b64):
+    data = base64.b64decode(content_b64.encode("ascii"))
+    if len(data) > MAX_FILE_BYTES:
+        raise ValueError("content too large")
+
+    parent = os.path.dirname(file_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    with open(file_path, "wb") as f:
+        f.write(data)
+
+    return len(data)
+
+
+def handle_delete(file_path):
+    file_path = normalize_windows_path(file_path)
+    file_path = require_abs_windows_path(file_path)
+    if not os.path.exists(file_path):
+        raise FileNotFoundError("not found")
+    if os.path.isdir(file_path):
+        raise ValueError("deleting folders not allowed")
+
+    os.remove(file_path)
+    return True
+
+
+def handle_list_drives():
+    drives = []
+    try:
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+        type_names = {
+            0: "unknown",
+            1: "no_root",
+            2: "removable",
+            3: "local",
+            4: "network",
+            5: "cdrom",
+            6: "ramdisk",
+        }
+
+        for i in range(26):
+            if mask & (1 << i):
+                letter = chr(ord("A") + i)
+                path = f"{letter}:\\"
+                dtype = ctypes.windll.kernel32.GetDriveTypeW(ctypes.c_wchar_p(path))
+                drives.append(
+                    {
+                        "name": letter,
+                        "path": path,
+                        "type": type_names.get(dtype, str(dtype)),
+                    }
+                )
+    except Exception:
+        # fallback: scan A-Z existence (ช้ากว่า แต่กันกรณี ctypes ใช้งานไม่ได้)
+        for i in range(26):
+            letter = chr(ord("A") + i)
+            path = f"{letter}:\\"
+            if os.path.isdir(path):
+                drives.append({"name": letter, "path": path, "type": "unknown"})
+
+    drives.sort(key=lambda x: x["name"])
+    return drives
+
+
+def handle_client(conn, addr):
+    print(f"connected: {addr}")
+    f = conn.makefile("rwb", buffering=0)
+    try:
+        while True:
+            line = f.readline()
+            if not line:
+                break
+
+            text = line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not text:
+                continue
+
+            # ถ้าเป็น JSON ให้ทำงานไฟล์
+            trimmed = text.lstrip()
+            if trimmed.startswith("{"):
+                try:
+                    req = json.loads(text)
+                    token = req.get("token")
+                    if token != TOKEN:
+                        send_json(f, {"ok": False, "error": "bad token"})
+                        continue
+
+                    action = str(req.get("action", "")).lower()
+                    rel_path = req.get("path", "")
+
+                    if action == "list_drives":
+                        items = handle_list_drives()
+                        send_json(f, {"ok": True, "result": items})
+                        continue
+
+                    if action == "list_dir":
+                        file_path = require_abs_windows_path(rel_path)
+                        items = handle_list_dir(file_path)
+                        send_json(f, {"ok": True, "result": items})
+                    elif action == "read_text":
+                        file_path = require_abs_windows_path(rel_path)
+                        if not os.path.isfile(file_path):
+                            raise FileNotFoundError("file not found")
+                        content_b64 = handle_read_text(file_path)
+                        send_json(f, {"ok": True, "result": {"content_b64": content_b64}})
+                    elif action == "read_file":
+                        file_path = require_abs_windows_path(rel_path)
+                        if not os.path.isfile(file_path):
+                            raise FileNotFoundError("file not found")
+                        payload = handle_read_file(file_path)
+                        send_json(f, {"ok": True, "result": payload})
+                    elif action == "read_file_chunk":
+                        file_path = require_abs_windows_path(rel_path)
+                        if not os.path.isfile(file_path):
+                            raise FileNotFoundError("file not found")
+
+                        offset = req.get("offset", 0)
+                        length = req.get("length", CHUNK_BYTES)
+                        payload = handle_read_file_chunk(file_path, offset, length)
+                        send_json(f, {"ok": True, "result": payload})
+                    elif action == "write_text":
+                        file_path = require_abs_windows_path(rel_path)
+                        content_b64 = req.get("content_b64", "")
+                        if not content_b64:
+                            raise ValueError("missing content_b64")
+                        written = handle_write_text(file_path, content_b64)
+                        send_json(f, {"ok": True, "result": {"written_bytes": written}})
+                    elif action == "delete_file":
+                        file_path = require_abs_windows_path(rel_path)
+                        ok = handle_delete(file_path)
+                        send_json(f, {"ok": True, "result": {"deleted": ok}})
+                    else:
+                        send_json(f, {"ok": False, "error": "unknown action"})
+
+                except Exception as e:
+                    send_json(f, {"ok": False, "error": str(e)})
+
+                continue
+
+            # โหมดแชทเดิม
+            print(f"message: {text}")
+            reply = f"ACK: {text}\n".encode("utf-8")
+            f.write(reply)
+
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+        conn.close()
+        print(f"disconnected: {addr}")
+
+
+def main():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((HOST, PORT))
+        s.listen()
+
+        print(f"listening on {PORT}")
+        while True:
+            conn, addr = s.accept()
+            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()
